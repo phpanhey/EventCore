@@ -4,6 +4,8 @@ import de.panhey.eventcore.entities.Event;
 import de.panhey.eventcore.repositories.EventRepository;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,10 +17,11 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.text.SimpleDateFormat;
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.List;
 
 @Component
 public class ResetAndImportEventsDB {
@@ -32,31 +35,19 @@ public class ResetAndImportEventsDB {
     @Scheduled(fixedDelay = 14400000)
     public void resetAndImportEventsDB() {
         eventRepository.deleteAll();
-        requestBremenDEEvents();
-        importDB(requestBremenDEEvents());
+
+        //importDB(requestBremenDEEvents());
+        importDB(requestKinderzeitEvents());
         logger.info("Successfully reset and imported events to DB " + eventRepository.count());
     }
 
-    private void importDB(JSONArray res) {
-        for (int i = 0; i < res.length(); i++) {
-            JSONObject event = res.getJSONObject(i);
-
-            if (event.isNull("title") || event.isNull("description") || event.isNull("nextDate") || event.isNull("address")) {
-                continue;
-            }
-
-            String title = event.getString("title");
-            String description = event.getString("description");
-            String address = event.getJSONObject("address").getJSONObject("venue").getString("address");
-            LocalDateTime localDateTime = LocalDateTime.ofInstant(Instant.ofEpochSecond(event.getLong("nextDate")), ZoneId.systemDefault());
-            Event e = new Event(title, description, localDateTime, localDateTime, address);
-
-            eventRepository.save(e);
-        }
+    private void importDB(List<Event> events) {
+        eventRepository.saveAll(events);
     }
 
-    private JSONArray requestBremenDEEvents() {
-        JSONArray res = new JSONArray();
+    private List<Event> requestBremenDEEvents() {
+        JSONArray jsonResults = new JSONArray();
+        List<Event> eventResults = new ArrayList<>();
         try {
             URI uri = new URI("https://login.bremen.de/api/event-search/search");
 
@@ -86,15 +77,95 @@ public class ResetAndImportEventsDB {
                 response = client.send(request, HttpResponse.BodyHandlers.ofString());
             }
 
-            res = new JSONArray(response.body());
+            jsonResults = new JSONArray(response.body());
 
-            logger.info("Successfully fetched events from API. Number of events: {}", res.length());
+            logger.info("Successfully fetched events from API. Number of events: {}", jsonResults.length());
 
         } catch (Exception e) {
             logger.error("Error occurred while fetching events from API", e);
         }
-        return res;
+
+        for (int i = 0; i < jsonResults.length(); i++) {
+            JSONObject event = jsonResults.getJSONObject(i);
+
+            if (event.isNull("title") || event.isNull("description") || event.isNull("nextDate") || event.isNull("address")) {
+                continue;
+            }
+
+            String title = event.getString("title");
+            String description = event.getString("description");
+            String address = event.getJSONObject("address").getJSONObject("venue").getString("address");
+            LocalDateTime localDateTime = LocalDateTime.ofInstant(Instant.ofEpochSecond(event.getLong("nextDate")), ZoneId.systemDefault());
+            eventResults.add(new Event(title, description, localDateTime, localDateTime, address));
+        }
+        return eventResults;
     }
+
+    private List<Event> requestKinderzeitEvents() {
+        ArrayList<String> allEventsasString = new ArrayList<>();
+        ArrayList<Event> allEvents = new ArrayList<>();
+
+        int offset = 0;
+        boolean hasMore = true;
+
+        try {
+            // Create HttpClient instance
+            HttpClient client = HttpClient.newHttpClient();
+
+            while (hasMore) {
+                // Build the URL with the current offset
+                String apiUrl = String.format("https://kinderzeit-bremen.de/api/sprocket/calendar/1192/get_calendar_events?limit=10&offset=%d&seed=null&section_id=null&dtstart=2024-06-22", offset);
+
+                // Create URI and HttpRequest
+                URI uri = new URI(apiUrl);
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(uri)
+                        .GET()
+                        .build();
+
+                // Send the request and get the response
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+                // Check if the response status code is 200 OK
+                if (response.statusCode() == 200) {
+                    JSONObject jsonResponse = new JSONObject(response.body());
+
+                    // Extract "results" array and append to allEvents
+                    JSONArray events = jsonResponse.getJSONArray("results");
+                    for (int i = 0; i < events.length(); i++) {
+                        allEventsasString.add(events.getString(i));
+                    }
+
+                    // Update hasMore based on the "has_more" flag
+                    hasMore = jsonResponse.getBoolean("has_more");
+                    if (hasMore) {
+                        offset += 10; // Increase offset by 10 for the next request
+                    }
+                } else {
+                    logger.error("Failed to fetch events. HTTP response code: {}", response.statusCode());
+                    break;
+                }
+            }
+
+            logger.info("Successfully fetched all events from API. Total number of events: {}", allEventsasString.size());
+        } catch (Exception e) {
+            logger.error("Error occurred while fetching events from API", e);
+        }
+
+        for (String event : allEventsasString) {
+
+            Document doc = Jsoup.parse(event);
+
+            String title = doc.select("h3 a").first().text();
+            String description = doc.select(".mp-description span").first().text();
+            //String date = doc.select(".mp-date .mp-start").first().text();
+            LocalDateTime startDate = LocalDateTime.of(LocalDate.parse(doc.select(".mp-date .mp-start").first().text(), DateTimeFormatter.ofPattern("dd.MM.yyyy")), LocalTime.MIDNIGHT);
+            String location = doc.select(".mp-location a").first().text();
+            allEvents.add(new Event(title, description, startDate, startDate, location));
+        }
+        return allEvents;
+    }
+
 
     private String getDateString(Calendar cal) {
         return new SimpleDateFormat("yyyy-MM-dd").format(cal.getTime());
