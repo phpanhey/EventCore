@@ -22,6 +22,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
+import java.util.Optional;
+
+import org.jsoup.nodes.Element;
 
 @Component
 public class ResetAndImportEventsDB {
@@ -35,8 +38,7 @@ public class ResetAndImportEventsDB {
     @Scheduled(fixedDelay = 14400000)
     public void resetAndImportEventsDB() {
         eventRepository.deleteAll();
-
-        //importDB(requestBremenDEEvents());
+        importDB(requestBremenDEEvents());
         importDB(requestKinderzeitEvents());
         logger.info("Successfully reset and imported events to DB " + eventRepository.count());
     }
@@ -110,40 +112,43 @@ public class ResetAndImportEventsDB {
 
         try {
             // Create HttpClient instance
-            HttpClient client = HttpClient.newHttpClient();
+            try (HttpClient client = HttpClient.newHttpClient()) {
 
-            while (hasMore) {
-                // Build the URL with the current offset
-                String apiUrl = String.format("https://kinderzeit-bremen.de/api/sprocket/calendar/1192/get_calendar_events?limit=10&offset=%d&seed=null&section_id=null&dtstart=2024-06-22", offset);
+                while (hasMore) {
+                    // Build the URL with the current offset
+                    Calendar currentDate = Calendar.getInstance();
+                    String formattedDate = getDateString(currentDate);
+                    String apiUrl = String.format("https://kinderzeit-bremen.de/api/sprocket/calendar/1192/get_calendar_events?limit=10&offset=%d&seed=null&section_id=null&dtstart=%s", offset, formattedDate);
 
-                // Create URI and HttpRequest
-                URI uri = new URI(apiUrl);
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(uri)
-                        .GET()
-                        .build();
+                    // Create URI and HttpRequest
+                    URI uri = new URI(apiUrl);
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(uri)
+                            .GET()
+                            .build();
 
-                // Send the request and get the response
-                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                    // Send the request and get the response
+                    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-                // Check if the response status code is 200 OK
-                if (response.statusCode() == 200) {
-                    JSONObject jsonResponse = new JSONObject(response.body());
+                    // Check if the response status code is 200 OK
+                    if (response.statusCode() == 200) {
+                        JSONObject jsonResponse = new JSONObject(response.body());
 
-                    // Extract "results" array and append to allEvents
-                    JSONArray events = jsonResponse.getJSONArray("results");
-                    for (int i = 0; i < events.length(); i++) {
-                        allEventsasString.add(events.getString(i));
+                        // Extract "results" array and append to allEvents
+                        JSONArray events = jsonResponse.getJSONArray("results");
+                        for (int i = 0; i < events.length(); i++) {
+                            allEventsasString.add(events.getString(i));
+                        }
+
+                        // Update hasMore based on the "has_more" flag
+                        hasMore = jsonResponse.getBoolean("has_more");
+                        if (hasMore) {
+                            offset += 10; // Increase offset by 10 for the next request
+                        }
+                    } else {
+                        logger.error("Failed to fetch events. HTTP response code: {}", response.statusCode());
+                        break;
                     }
-
-                    // Update hasMore based on the "has_more" flag
-                    hasMore = jsonResponse.getBoolean("has_more");
-                    if (hasMore) {
-                        offset += 10; // Increase offset by 10 for the next request
-                    }
-                } else {
-                    logger.error("Failed to fetch events. HTTP response code: {}", response.statusCode());
-                    break;
                 }
             }
 
@@ -153,15 +158,32 @@ public class ResetAndImportEventsDB {
         }
 
         for (String event : allEventsasString) {
-
             Document doc = Jsoup.parse(event);
 
-            String title = doc.select("h3 a").first().text();
-            String description = doc.select(".mp-description span").first().text();
-            //String date = doc.select(".mp-date .mp-start").first().text();
-            LocalDateTime startDate = LocalDateTime.of(LocalDate.parse(doc.select(".mp-date .mp-start").first().text(), DateTimeFormatter.ofPattern("dd.MM.yyyy")), LocalTime.MIDNIGHT);
-            String location = doc.select(".mp-location a").first().text();
-            allEvents.add(new Event(title, description, startDate, startDate, location));
+            String title = Optional.ofNullable(doc.select("h3 a").first())
+                    .map(Element::text)
+                    .orElse(null);
+
+            String description = Optional.ofNullable(doc.select(".mp-description span").first())
+                    .map(Element::text)
+                    .orElse(null);
+
+            String dateString = Optional.ofNullable(doc.select(".mp-date .mp-start").first())
+                    .map(Element::text)
+                    .orElse(null);
+
+            LocalDateTime startDate = null;
+            if (dateString != null) {
+                startDate = LocalDateTime.of(LocalDate.parse(dateString, DateTimeFormatter.ofPattern("dd.MM.yyyy")), LocalTime.MIDNIGHT);
+            }
+
+            String location = Optional.ofNullable(doc.select(".mp-location a").first())
+                    .map(Element::text)
+                    .orElse(null);
+
+            if (title != null && description != null && startDate != null && location != null) {
+                allEvents.add(new Event(title, description, startDate, startDate, location));
+            }
         }
         return allEvents;
     }
